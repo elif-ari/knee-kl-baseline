@@ -10,11 +10,11 @@ import timm
 from torchmetrics.classification import MulticlassF1Score, MulticlassAccuracy
 
 # -----------------------
-# Ayarlar (CPU için optimize)
+# Ayarlar
 # -----------------------
-IMG_SIZE = 224          # CPU için 384 yerine 224
-BATCH_SIZE = 8          # CPU'da 8 iyi başlangıç
-EPOCHS = 8              # önce kısa deneme
+IMG_SIZE = 224
+BATCH_SIZE = 8
+EPOCHS = 8
 LR = 3e-4
 NUM_CLASSES = 5
 SEED = 42
@@ -24,18 +24,19 @@ np.random.seed(SEED)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
+RUNS_DIR = BASE_DIR / "runs"
+RUNS_DIR.mkdir(parents=True, exist_ok=True)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
 
 train_df = pd.read_csv(DATA_DIR / "train.csv")
 val_df   = pd.read_csv(DATA_DIR / "val.csv")
 test_df  = pd.read_csv(DATA_DIR / "test.csv")
-
-device = torch.device("cpu")  
-
-print("Device:", device)
 print("Train/Val/Test:", len(train_df), len(val_df), len(test_df))
 
 # -----------------------
-# Dataset
+# Transformlar (seninkiyle aynı)
 # -----------------------
 train_tf = transforms.Compose([
     transforms.ToPILImage(),
@@ -50,6 +51,9 @@ eval_tf = transforms.Compose([
     transforms.ToTensor(),
 ])
 
+# -----------------------
+# Dataset (seninkiyle aynı)
+# -----------------------
 class KneeDataset(Dataset):
     def __init__(self, df, transform=None):
         self.df = df.reset_index(drop=True)
@@ -68,7 +72,6 @@ class KneeDataset(Dataset):
             raise FileNotFoundError(f"Okunamayan görüntü: {img_path}")
 
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-
         if self.transform:
             img = self.transform(img)
 
@@ -79,7 +82,7 @@ val_ds   = KneeDataset(val_df, transform=eval_tf)
 test_ds  = KneeDataset(test_df, transform=eval_tf)
 
 # -----------------------
-# Weighted sampler (KL4 az diye)
+# Weighted sampler (train kodunla aynı)
 # -----------------------
 label_counts = train_df["label"].value_counts().sort_index()
 print("Train class counts:", label_counts.to_dict())
@@ -96,23 +99,60 @@ train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, num_
 val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-# -----------------------
-# Model (EfficientNet-B0)
-# -----------------------
-model = timm.create_model("tf_efficientnet_b0", pretrained=True, num_classes=NUM_CLASSES)
-model = model.to(device)
+# =========================================================
+# ✅ ORDINAL MODEL: EfficientNet backbone + ordinal head
+# =========================================================
+class OrdinalNet(nn.Module):
+    """
+    EfficientNet-B0 backbone + 4 adet ordinal logit (y>0, y>1, y>2, y>3)
+    """
+    def __init__(self, backbone_name="tf_efficientnet_b0", pretrained=True):
+        super().__init__()
+        self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0)  # feature extractor
+        feat_dim = self.backbone.num_features
+        self.head = nn.Linear(feat_dim, NUM_CLASSES - 1)  # 4 output
 
-criterion = nn.CrossEntropyLoss()
+    def forward(self, x):
+        feats = self.backbone(x)     # (B, feat_dim)
+        logits = self.head(feats)    # (B, 4)
+        return logits
+
+model = OrdinalNet(pretrained=True).to(device)
+
+# =========================================================
+# ✅ ORDINAL TARGET + LOSS (4 adet BCE)
+# =========================================================
+bce = nn.BCEWithLogitsLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
+def labels_to_ordinal_targets(labels: torch.Tensor, num_classes=5) -> torch.Tensor:
+    """
+    labels: (B,) 0..4
+    return: (B, num_classes-1) 0/1 target matrix
+    örn KL2 -> [1,1,0,0]
+    """
+    # thresholds: 0,1,2,3
+    thresholds = torch.arange(num_classes - 1, device=labels.device)  # (4,)
+    # labels[:, None] > thresholds[None, :]
+    targets = (labels.unsqueeze(1) > thresholds.unsqueeze(0)).float()
+    return targets
+
+def ordinal_logits_to_class(logits: torch.Tensor) -> torch.Tensor:
+    """
+    logits: (B,4)
+    probs = sigmoid(logits)
+    sınıf = kaç tane threshold geçti? (prob>0.5) sayısı
+    """
+    probs = torch.sigmoid(logits)
+    passed = (probs > 0.5).sum(dim=1)   # 0..4
+    return passed
+
+# Metrics: bizim prediction sınıf 0..4 olacak
 acc_metric = MulticlassAccuracy(num_classes=NUM_CLASSES).to(device)
 f1_metric  = MulticlassF1Score(num_classes=NUM_CLASSES, average="macro").to(device)
 
 def run_one_epoch(loader, train=True):
-    if train:
-        model.train()
-    else:
-        model.eval()
+    model.train() if train else model.eval()
 
     total_loss = 0.0
     acc_metric.reset()
@@ -122,9 +162,11 @@ def run_one_epoch(loader, train=True):
         images = images.to(device)
         labels = labels.to(device)
 
+        targets = labels_to_ordinal_targets(labels, num_classes=NUM_CLASSES)  # (B,4)
+
         with torch.set_grad_enabled(train):
-            logits = model(images)
-            loss = criterion(logits, labels)
+            logits = model(images)                # (B,4)
+            loss = bce(logits, targets)
 
             if train:
                 optimizer.zero_grad()
@@ -133,7 +175,7 @@ def run_one_epoch(loader, train=True):
 
         total_loss += loss.item() * images.size(0)
 
-        preds = torch.argmax(logits, dim=1)
+        preds = ordinal_logits_to_class(logits)   # (B,)
         acc_metric.update(preds, labels)
         f1_metric.update(preds, labels)
 
@@ -143,11 +185,10 @@ def run_one_epoch(loader, train=True):
     return avg_loss, acc, f1
 
 # -----------------------
-# Train loop (best val F1 ile kaydet)
+# Train loop
 # -----------------------
 best_val_f1 = -1.0
-best_path = BASE_DIR / "runs" / "best_baseline.pt"
-best_path.parent.mkdir(parents=True, exist_ok=True)
+best_path = RUNS_DIR / "best_ordinal.pt"
 
 for epoch in range(1, EPOCHS + 1):
     tr_loss, tr_acc, tr_f1 = run_one_epoch(train_loader, train=True)
@@ -163,26 +204,10 @@ for epoch in range(1, EPOCHS + 1):
         print("  ✅ best saved:", best_path.name, "val_f1=", round(best_val_f1, 4))
 
 # -----------------------
-# Test (en iyi modeli yükle)
+# Test
 # -----------------------
 model.load_state_dict(torch.load(best_path, map_location=device))
 te_loss, te_acc, te_f1 = run_one_epoch(test_loader, train=False)
-print("\nTEST RESULTS")
+print("\nTEST RESULTS (ORDINAL)")
 print("loss:", round(te_loss, 4), "acc:", round(te_acc, 4), "macro_f1:", round(te_f1, 4))
-
-# -----------------------
-# Basit örnek inference: KL + yüzde
-# -----------------------
-def severity_percent_from_pred(pred_kl: int) -> float:
-    return (pred_kl / 4.0) * 100.0
-
-model.eval()
-images, labels = next(iter(test_loader))
-with torch.no_grad():
-    logits = model(images.to(device))
-    probs = torch.softmax(logits, dim=1)
-    preds = torch.argmax(probs, dim=1).cpu().numpy()
-
-print("\nÖrnek tahminler (ilk 8):")
-for i in range(min(8, len(preds))):
-    print(f"GT={int(labels[i])}  PRED={int(preds[i])}  severity%={severity_percent_from_pred(int(preds[i])):.1f}")
+print("✅ checkpoint:", best_path)
