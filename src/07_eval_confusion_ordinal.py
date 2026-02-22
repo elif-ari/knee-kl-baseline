@@ -12,7 +12,7 @@ from sklearn.metrics import confusion_matrix, classification_report, ConfusionMa
 import matplotlib.pyplot as plt
 
 # -----------------------
-# Ayarlar (06 ile aynı)
+# Ayarlar
 # -----------------------
 IMG_SIZE = 224
 BATCH_SIZE = 8
@@ -30,21 +30,17 @@ RUNS_DIR.mkdir(parents=True, exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
 
+val_df  = pd.read_csv(DATA_DIR / "val.csv")
 test_df = pd.read_csv(DATA_DIR / "test.csv")
+print("Val:", len(val_df))
 print("Test:", len(test_df))
 
-# -----------------------
-# Eval transform (06 ile aynı)
-# -----------------------
 eval_tf = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
 ])
 
-# -----------------------
-# Dataset (relative path robust)
-# -----------------------
 class KneeDataset(Dataset):
     def __init__(self, df, transform=None, base_dir: Path = None):
         self.df = df.reset_index(drop=True)
@@ -59,7 +55,6 @@ class KneeDataset(Dataset):
         img_path = Path(row["path"])
         label = int(row["label"])
 
-        # CSV path relative ise proje köküne göre tamamla
         if not img_path.is_absolute() and self.base_dir is not None:
             img_path = self.base_dir / img_path
 
@@ -73,39 +68,78 @@ class KneeDataset(Dataset):
 
         return img, torch.tensor(label, dtype=torch.long), str(img_path)
 
-test_ds = KneeDataset(test_df, transform=eval_tf, base_dir=BASE_DIR)
-test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+val_loader  = DataLoader(KneeDataset(val_df,  eval_tf, BASE_DIR),  batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+test_loader = DataLoader(KneeDataset(test_df, eval_tf, BASE_DIR),  batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-# =========================================================
-# ORDINAL MODEL (06 ile aynı)
-# =========================================================
+# -----------------------
+# Model
+# -----------------------
 class OrdinalNet(nn.Module):
-    """
-    EfficientNet-B0 backbone + 4 ordinal logit (y>0, y>1, y>2, y>3)
-    """
     def __init__(self, backbone_name="tf_efficientnet_b0", pretrained=False):
         super().__init__()
         self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0)
         feat_dim = self.backbone.num_features
-        self.head = nn.Linear(feat_dim, NUM_CLASSES - 1)  # 4 output
+        self.head = nn.Linear(feat_dim, NUM_CLASSES - 1)
 
     def forward(self, x):
         feats = self.backbone(x)
-        logits = self.head(feats)
-        return logits
+        return self.head(feats)
 
-def ordinal_logits_to_class(logits: torch.Tensor) -> torch.Tensor:
+def probs_to_class(probs: torch.Tensor, thresholds=(0.5,0.5,0.5,0.5)) -> torch.Tensor:
+    thr = torch.tensor(thresholds, device=probs.device).view(1, -1)
+    return (probs > thr).sum(dim=1)
+
+@torch.no_grad()
+def collect_probs(loader):
+    model.eval()
+    all_probs, all_y, all_paths = [], [], []
+    for images, labels, paths in loader:
+        images = images.to(device)
+        logits = model(images)          # (B,4)
+        probs = torch.sigmoid(logits)   # (B,4)
+        all_probs.append(probs.cpu().numpy())
+        all_y.append(labels.numpy())
+        all_paths.extend(paths)
+    return np.concatenate(all_probs), np.concatenate(all_y), all_paths
+
+def macro_f1_from_cm(cm):
+    # macro F1 hesapla (sklearn kullanmadan hızlı)
+    eps = 1e-9
+    f1s = []
+    for k in range(cm.shape[0]):
+        tp = cm[k, k]
+        fp = cm[:, k].sum() - tp
+        fn = cm[k, :].sum() - tp
+        prec = tp / (tp + fp + eps)
+        rec  = tp / (tp + fn + eps)
+        f1 = 2 * prec * rec / (prec + rec + eps)
+        f1s.append(f1)
+    return float(np.mean(f1s))
+
+def tune_thresholds(val_probs, val_y):
     """
-    logits: (B,4)
-    probs = sigmoid(logits)
-    sınıf = kaç tane threshold geçti? (prob>0.5) sayısı -> 0..4
+    Çok basit ve etkili: her threshold için 0.2..0.8 arası tarıyoruz
+    (ordinalde genelde yeterli)
     """
-    probs = torch.sigmoid(logits)
-    passed = (probs > 0.5).sum(dim=1)
-    return passed
+    grid = np.linspace(0.2, 0.8, 13)  # 0.2,0.25,...0.8
+    best_thr = (0.5,0.5,0.5,0.5)
+    best_score = -1.0
+
+    for t0 in grid:
+        for t1 in grid:
+            for t2 in grid:
+                for t3 in grid:
+                    thr = (t0,t1,t2,t3)
+                    pred = (val_probs > np.array(thr).reshape(1,-1)).sum(axis=1)
+                    cm = confusion_matrix(val_y, pred, labels=list(range(NUM_CLASSES)))
+                    score = macro_f1_from_cm(cm)
+                    if score > best_score:
+                        best_score = score
+                        best_thr = thr
+    return best_thr, best_score
 
 # -----------------------
-# Checkpoint yükle
+# Load checkpoint
 # -----------------------
 ckpt_path = RUNS_DIR / "best_ordinal.pt"
 if not ckpt_path.exists():
@@ -113,66 +147,52 @@ if not ckpt_path.exists():
 
 model = OrdinalNet(pretrained=False).to(device)
 model.load_state_dict(torch.load(ckpt_path, map_location=device))
-model.eval()
-
 print("Loaded:", ckpt_path)
 
 # -----------------------
-# Inference
+# 1) Val üzerinde threshold tuning
 # -----------------------
-all_y_true = []
-all_y_pred = []
-all_paths  = []
-
-with torch.no_grad():
-    for images, labels, paths in test_loader:
-        images = images.to(device)
-        labels = labels.to(device)
-
-        logits = model(images)                    # (B,4)
-        preds = ordinal_logits_to_class(logits)   # (B,)
-
-        all_y_true.append(labels.cpu().numpy())
-        all_y_pred.append(preds.cpu().numpy())
-        all_paths.extend(paths)
-
-y_true = np.concatenate(all_y_true)
-y_pred = np.concatenate(all_y_pred)
+val_probs, val_y, _ = collect_probs(val_loader)
+best_thr, best_val_macro_f1 = tune_thresholds(val_probs, val_y)
+print("\nBest thresholds (val):", best_thr)
+print("Best val macro_f1 (approx):", round(best_val_macro_f1, 4))
 
 # -----------------------
-# Raporlar
+# 2) Test evaluate (tuned thresholds)
 # -----------------------
-print("\n=== Classification Report (Test / Ordinal) ===")
-print(classification_report(y_true, y_pred, digits=4, zero_division=0))
+test_probs, test_y, test_paths = collect_probs(test_loader)
+test_pred = (test_probs > np.array(best_thr).reshape(1,-1)).sum(axis=1)
 
-cm = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES)))
+print("\n=== Classification Report (Test / Ordinal, tuned thresholds) ===")
+print(classification_report(test_y, test_pred, digits=4, zero_division=0))
+
+cm = confusion_matrix(test_y, test_pred, labels=list(range(NUM_CLASSES)))
 print("\n=== Confusion Matrix (raw counts) ===")
 print(cm)
 
-# Normalized confusion matrix
 disp = ConfusionMatrixDisplay.from_predictions(
-    y_true,
-    y_pred,
+    test_y,
+    test_pred,
     labels=list(range(NUM_CLASSES)),
     display_labels=[f"KL{i}" for i in range(NUM_CLASSES)],
     normalize="true",
     xticks_rotation=45
 )
-plt.title("Ordinal Model - Confusion Matrix (Normalized)")
+plt.title("Ordinal Model - Confusion Matrix (Normalized, Tuned Thresholds)")
 plt.tight_layout()
 
-out_fig = RUNS_DIR / "confusion_ordinal_normalized.png"
+out_fig = RUNS_DIR / "confusion_ordinal_tuned.png"
 plt.savefig(out_fig, dpi=200)
 print("\nSaved figure:", out_fig)
 
-# İstersen yanlış örnekleri kaydet
-wrong_idx = np.where(y_true != y_pred)[0]
+# misclassified list
+wrong_idx = np.where(test_y != test_pred)[0]
 wrong_df = pd.DataFrame({
-    "path": [all_paths[i] for i in wrong_idx],
-    "y_true": y_true[wrong_idx],
-    "y_pred": y_pred[wrong_idx],
+    "path": [test_paths[i] for i in wrong_idx],
+    "y_true": test_y[wrong_idx],
+    "y_pred": test_pred[wrong_idx],
 })
-out_csv = RUNS_DIR / "ordinal_misclassified.csv"
+out_csv = RUNS_DIR / "ordinal_misclassified_tuned.csv"
 wrong_df.to_csv(out_csv, index=False)
 print("Saved misclassified list:", out_csv)
 
