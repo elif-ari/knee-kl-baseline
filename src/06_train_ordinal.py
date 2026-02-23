@@ -14,7 +14,7 @@ from torchmetrics.classification import MulticlassF1Score, MulticlassAccuracy
 # -----------------------
 IMG_SIZE = 224
 BATCH_SIZE = 8
-EPOCHS = 8
+EPOCHS = 12  
 LR = 3e-4
 NUM_CLASSES = 5
 SEED = 42
@@ -36,12 +36,14 @@ test_df  = pd.read_csv(DATA_DIR / "test.csv")
 print("Train/Val/Test:", len(train_df), len(val_df), len(test_df))
 
 # -----------------------
-# Transformlar (seninkiyle aynı)
+# Transformlar (stabil + iyi)
 # -----------------------
 train_tf = transforms.Compose([
     transforms.ToPILImage(),
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.RandomRotation(5),
+    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.85, 1.0)),
+    transforms.RandomRotation(10),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.ColorJitter(brightness=0.15, contrast=0.15),
     transforms.ToTensor(),
 ])
 
@@ -52,22 +54,26 @@ eval_tf = transforms.Compose([
 ])
 
 # -----------------------
-# Dataset (seninkiyle aynı)
+# Dataset (relative path robust)
 # -----------------------
 class KneeDataset(Dataset):
-    def __init__(self, df, transform=None):
+    def __init__(self, df, transform=None, base_dir: Path = None):
         self.df = df.reset_index(drop=True)
         self.transform = transform
+        self.base_dir = base_dir
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        img_path = row["path"]
+        img_path = Path(row["path"])
         label = int(row["label"])
 
-        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if not img_path.is_absolute() and self.base_dir is not None:
+            img_path = self.base_dir / img_path
+
+        img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
         if img is None:
             raise FileNotFoundError(f"Okunamayan görüntü: {img_path}")
 
@@ -77,12 +83,12 @@ class KneeDataset(Dataset):
 
         return img, torch.tensor(label, dtype=torch.long)
 
-train_ds = KneeDataset(train_df, transform=train_tf)
-val_ds   = KneeDataset(val_df, transform=eval_tf)
-test_ds  = KneeDataset(test_df, transform=eval_tf)
+train_ds = KneeDataset(train_df, transform=train_tf, base_dir=BASE_DIR)
+val_ds   = KneeDataset(val_df, transform=eval_tf, base_dir=BASE_DIR)
+test_ds  = KneeDataset(test_df, transform=eval_tf, base_dir=BASE_DIR)
 
 # -----------------------
-# Weighted sampler (train kodunla aynı)
+# Weighted sampler
 # -----------------------
 label_counts = train_df["label"].value_counts().sort_index()
 print("Train class counts:", label_counts.to_dict())
@@ -94,12 +100,14 @@ sampler = WeightedRandomSampler(
     num_samples=len(sample_weights),
     replacement=True
 )
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, num_workers=2, pin_memory=False)
-val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=False)
-test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=False)
+
+# Windows için güvenli: num_workers=0
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, num_workers=0, pin_memory=False)
+val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=False)
+test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=False)
 
 # =========================================================
-# ✅ ORDINAL MODEL: EfficientNet backbone + ordinal head
+# ORDINAL MODEL
 # =========================================================
 class OrdinalNet(nn.Module):
     """
@@ -107,52 +115,46 @@ class OrdinalNet(nn.Module):
     """
     def __init__(self, backbone_name="tf_efficientnet_b0", pretrained=True):
         super().__init__()
-        self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0)  # feature extractor
+        self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0)
         feat_dim = self.backbone.num_features
-        self.head = nn.Linear(feat_dim, NUM_CLASSES - 1)  # 4 output
+        self.head = nn.Linear(feat_dim, NUM_CLASSES - 1)
 
     def forward(self, x):
-        feats = self.backbone(x)     # (B, feat_dim)
-        logits = self.head(feats)    # (B, 4)
+        feats = self.backbone(x)
+        logits = self.head(feats)
         return logits
 
 model = OrdinalNet(pretrained=True).to(device)
 
 # =========================================================
-# ✅ ORDINAL TARGET + LOSS (4 adet BCE)
+# ORDINAL TARGET + LOSS (pos_weight YOK)
 # =========================================================
 bce = nn.BCEWithLogitsLoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode="max", factor=0.5, patience=1
+)
 
 def labels_to_ordinal_targets(labels: torch.Tensor, num_classes=5) -> torch.Tensor:
-    """
-    labels: (B,) 0..4
-    return: (B, num_classes-1) 0/1 target matrix
-    örn KL2 -> [1,1,0,0]
-    """
-    # thresholds: 0,1,2,3
-    thresholds = torch.arange(num_classes - 1, device=labels.device)  # (4,)
-    # labels[:, None] > thresholds[None, :]
+    thresholds = torch.arange(num_classes - 1, device=labels.device)
     targets = (labels.unsqueeze(1) > thresholds.unsqueeze(0)).float()
     return targets
 
-def ordinal_logits_to_class(logits: torch.Tensor) -> torch.Tensor:
-    """
-    logits: (B,4)
-    probs = sigmoid(logits)
-    sınıf = kaç tane threshold geçti? (prob>0.5) sayısı
-    """
-    probs = torch.sigmoid(logits)
-    passed = (probs > 0.5).sum(dim=1)   # 0..4
+def ordinal_logits_to_probs(logits: torch.Tensor) -> torch.Tensor:
+    return torch.sigmoid(logits)  # (B,4)
+
+def ordinal_probs_to_class(probs: torch.Tensor, thresholds=(0.5, 0.5, 0.5, 0.5)) -> torch.Tensor:
+    thr = torch.tensor(thresholds, device=probs.device).view(1, -1)
+    passed = (probs > thr).sum(dim=1)
     return passed
 
-# Metrics: bizim prediction sınıf 0..4 olacak
+# Metrics
 acc_metric = MulticlassAccuracy(num_classes=NUM_CLASSES).to(device)
 f1_metric  = MulticlassF1Score(num_classes=NUM_CLASSES, average="macro").to(device)
 
-def run_one_epoch(loader, train=True):
+def run_one_epoch(loader, train=True, thresholds=(0.5,0.5,0.5,0.5)):
     model.train() if train else model.eval()
-
     total_loss = 0.0
     acc_metric.reset()
     f1_metric.reset()
@@ -161,10 +163,10 @@ def run_one_epoch(loader, train=True):
         images = images.to(device)
         labels = labels.to(device)
 
-        targets = labels_to_ordinal_targets(labels, num_classes=NUM_CLASSES)  # (B,4)
+        targets = labels_to_ordinal_targets(labels, num_classes=NUM_CLASSES)
 
         with torch.set_grad_enabled(train):
-            logits = model(images)                # (B,4)
+            logits = model(images)
             loss = bce(logits, targets)
 
             if train:
@@ -174,7 +176,8 @@ def run_one_epoch(loader, train=True):
 
         total_loss += loss.item() * images.size(0)
 
-        preds = ordinal_logits_to_class(logits)   # (B,)
+        probs = ordinal_logits_to_probs(logits)
+        preds = ordinal_probs_to_class(probs, thresholds=thresholds)
         acc_metric.update(preds, labels)
         f1_metric.update(preds, labels)
 
@@ -184,29 +187,41 @@ def run_one_epoch(loader, train=True):
     return avg_loss, acc, f1
 
 # -----------------------
-# Train loop
+# Train loop + early stopping
 # -----------------------
 best_val_f1 = -1.0
 best_path = RUNS_DIR / "best_ordinal.pt"
+
+patience = 3
+bad_epochs = 0
 
 for epoch in range(1, EPOCHS + 1):
     tr_loss, tr_acc, tr_f1 = run_one_epoch(train_loader, train=True)
     va_loss, va_acc, va_f1 = run_one_epoch(val_loader, train=False)
 
+    lr_now = optimizer.param_groups[0]["lr"]
     print(f"Epoch {epoch:02d} | "
           f"train loss {tr_loss:.4f} acc {tr_acc:.4f} f1 {tr_f1:.4f} | "
-          f"val loss {va_loss:.4f} acc {va_acc:.4f} f1 {va_f1:.4f}")
+          f"val loss {va_loss:.4f} acc {va_acc:.4f} f1 {va_f1:.4f} | lr {lr_now:.6f}")
+
+    scheduler.step(va_f1)
 
     if va_f1 > best_val_f1:
         best_val_f1 = va_f1
+        bad_epochs = 0
         torch.save(model.state_dict(), best_path)
         print("  ✅ best saved:", best_path.name, "val_f1=", round(best_val_f1, 4))
+    else:
+        bad_epochs += 1
+        if bad_epochs >= patience:
+            print(f"🛑 Early stopping (no val_f1 improvement for {patience} epochs)")
+            break
 
 # -----------------------
-# Test
+# Test (default thresholds 0.5)
 # -----------------------
 model.load_state_dict(torch.load(best_path, map_location=device))
 te_loss, te_acc, te_f1 = run_one_epoch(test_loader, train=False)
-print("\nTEST RESULTS (ORDINAL)")
+print("\nTEST RESULTS (ORDINAL, thr=0.5)")
 print("loss:", round(te_loss, 4), "acc:", round(te_acc, 4), "macro_f1:", round(te_f1, 4))
 print("✅ checkpoint:", best_path)
